@@ -3,7 +3,11 @@ from bs4 import BeautifulSoup
 import datetime
 from smtplib import SMTP_SSL
 from email.mime.text import MIMEText
+from email.mime.base import MIMEBase
+from email.mime.multipart import MIMEMultipart
 from email.utils import formataddr
+from email import encoders
+from urllib.parse import unquote
 
 import config
 
@@ -22,11 +26,27 @@ def calculate_code(codes):
     return res
 
 
-def sendmail(title, author, time, content):
-    msg = MIMEText(content, 'html', 'utf-8')
+def sendmail(title, author, time, content, url="", attachments=[], possible_error=0):
+
+    msg = MIMEMultipart()
     msg['subject'] = title + ' ' + author + ' ' + time
     msg["from"] = formataddr(['NoticeRemainder', config.SMTP_SENDER])
     msg["to"] = ','.join(config.SMTP_RECIVER)
+    
+    if possible_error > 0:
+        content += "<br>可能有" + str(possible_error) + "个附件下载失败，请前往信息化平台手动下载"
+    content = "<br><a href='" + url + "'>公告链接</a>" + content
+    msg.attach(MIMEText(content, 'html', 'utf-8'))
+    
+    for attachment in attachments:
+        filename = attachment['filename']
+        content = attachment['content']
+        part = MIMEBase('application', 'octet-stream')
+        part.set_payload(content)
+        encoders.encode_base64(part)
+        part.add_header('Content-Disposition', 'attachment', filename=filename)
+        msg.attach(part)
+    
     with SMTP_SSL(config.SMTP_HOST, config.SMTP_PORT) as smtp:
         smtp.login(config.SMTP_USERNAME, config.SMTP_PASSWORD)
         smtp.sendmail(config.SMTP_SENDER, config.SMTP_RECIVER, msg.as_string())
@@ -45,7 +65,36 @@ def parse_notice(html):
         notices.append((title, author, time, link))
     return notices
 
-
+# 解析公告内容，将所有链接转换为绝对链接
+def parse_attachment(url, html_content, session):
+    possible_error = 0
+    attachments = []
+    soup = BeautifulSoup(html_content, "html.parser")
+    forms = soup.find_all('form')
+    for form in forms:
+        try:
+            method = form.get('method')
+            data = {x.get('name'): x.get('value') for x in form.find_all('input')}
+            links = form.find_all('a')
+            for link in links:
+                # 每个链接对应一个附件
+                href = link.get('href')
+                if href.startswith('javascript'):
+                    params = href.split("javascript:__doPostBack(")[1].split(")")[0].split(",")
+                    data['__EVENTTARGET'] = params[0][1:-1] # 移除单引号
+                    data['__EVENTARGUMENT'] = params[1][1:-1]
+                    method = session.post if method == 'post' else session.get
+                    res = method(url, data=data)
+                    if res.headers.get('Content-Type') == 'application/octet-stream':
+                        filename = res.headers.get('Content-Disposition').split('filename=')[1]
+                        attachments.append({
+                            'filename': unquote(filename),
+                            'content': res.content
+                        })
+        except Exception as e:
+            possible_error += 1
+    return attachments, possible_error
+                           
 def main():
     year  = datetime.datetime.now().year
     month = datetime.datetime.now().month
@@ -67,8 +116,9 @@ def main():
         for notice in notices:
             if notice[2] == cur_date:
                 res = s.get(notice[3])
-                content = res.text
-                sendmail(notice[0], notice[1], notice[2], content)
+                attachments, possible_error = parse_attachment(notice[3], res.text, s)
+                sendmail(notice[0], notice[1], notice[2], res.text, notice[3], attachments, possible_error)
+
 
 
 if __name__ == '__main__':
